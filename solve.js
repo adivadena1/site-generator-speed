@@ -283,8 +283,12 @@ function findSingleStar(s, from) {
 // instead of one escapeHtml call per character. `re` is threaded through the
 // recursive calls so no new RegExp is made for a nested span (the caller
 // resets lastIndex before every exec, so sharing it is safe).
+// The scan ALSO matches the five HTML specials, so a plain run between two
+// matches holds no special of either kind and is appended raw — no slice +
+// escapeHtml + replace-callback per run. An HTML special is escaped inline
+// from the ESCAPES table.
 function inline(s, env, re) {
-  re ??= /[\\`*[]/g;
+  re ??= /[\\`*[\&<>"']/g;
   let out = '';
   let i = 0;
   const n = s.length;
@@ -292,13 +296,19 @@ function inline(s, env, re) {
     re.lastIndex = i;
     const m = re.exec(s);
     const j = m === null ? n : m.index;
-    if (j > i) out += escapeHtml(s.slice(i, j));
+    if (j > i) out += s.slice(i, j);
     if (j >= n) break;
     const c = s[j];
+    if (c === '&' || c === '<' || c === '>' || c === '"' || c === "'") {
+      out += ESCAPES[c];
+      i = j + 1;
+      continue;
+    }
     if (c === '\\') {
       // escapeHtml of the escaped char: identity for every escapable char
-      // except '>', which is itself an HTML special ('&gt;').
-      if (j + 1 < n && ESCAPABLE.has(s[j + 1])) { out += escapeHtml(s[j + 1]); i = j + 2; }
+      // except '>', which is itself an HTML special ('&gt;'). A table lookup
+      // is that function on one character, without the call or the regex.
+      if (j + 1 < n && ESCAPABLE.has(s[j + 1])) { out += ESCAPES[s[j + 1]] ?? s[j + 1]; i = j + 2; }
       else { out += '\\'; i = j + 1; }
       continue;
     }
@@ -345,7 +355,7 @@ function renderMarkdown(src, env) {
   for (let k = 0; k < lines.length; k++) words += countWordsIn(lines[k]);
   let i = 0;
   const n = lines.length;
-  const re = /[\\`*[]/g; // threaded through inline()
+  const re = /[\\`*[\&<>"']/g; // threaded through inline()
   while (i < n) {
     const line = lines[i];
     if (line === '') { i++; continue; }
@@ -389,17 +399,26 @@ function renderMarkdown(src, env) {
           else if (CONTINUED.test(lines[i])) { items[items.length - 1].push(trimLine(lines[i])); i++; }
           else break;
         }
-        out.push(`<ul>\n${items.map((parts) => `<li>${inline(parts.join('\n'), env, re)}</li>\n`).join('')}</ul>\n`);
+        // Push <li>s straight into the output instead of map() + join():
+        // same concatenation, no intermediate array or string.
+        out.push('<ul>\n');
+        for (const parts of items) out.push(`<li>${inline(parts.length === 1 ? parts[0] : parts.join('\n'), env, re)}</li>\n`);
+        out.push('</ul>\n');
         continue;
       }
     } else if (c0 === 62) { // >
       const body = [];
       while (i < n && QUOTE.test(lines[i])) body.push(lines[i++].replace(/^> ?/, ''));
-      const inner = body.map(trimLine).filter((l) => l !== '');
+      // One loop for trim + drop-empty instead of map() + filter() (two arrays).
+      const inner = [];
+      for (const l of body) {
+        const t = trimLine(l);
+        if (t !== '') inner.push(t);
+      }
       out.push(
         inner.length === 0
           ? '<blockquote>\n</blockquote>\n'
-          : `<blockquote>\n<p>${inline(inner.join('\n'), env, re)}</p>\n</blockquote>\n`,
+          : `<blockquote>\n<p>${inline(inner.length === 1 ? inner[0] : inner.join('\n'), env, re)}</p>\n</blockquote>\n`,
       );
       continue;
     } else if (c0 >= 48 && c0 <= 57) { // digit
@@ -413,7 +432,9 @@ function renderMarkdown(src, env) {
           else break;
         }
         const open = Number(ordered[1]) !== 1 ? `<ol start="${Number(ordered[1])}">` : '<ol>';
-        out.push(`${open}\n${items.map((parts) => `<li>${inline(parts.join('\n'), env, re)}</li>\n`).join('')}</ol>\n`);
+        out.push(`${open}\n`);
+        for (const parts of items) out.push(`<li>${inline(parts.length === 1 ? parts[0] : parts.join('\n'), env, re)}</li>\n`);
+        out.push('</ol>\n');
         continue;
       }
     }
@@ -422,7 +443,9 @@ function renderMarkdown(src, env) {
     const body = [trimLine(line)];
     i++;
     while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
-    const html = inline(body.join('\n'), env, re);
+    // A one-line paragraph is the common case: join() of one element is the
+    // element itself, so skip the call.
+    const html = inline(body.length === 1 ? body[0] : body.join('\n'), env, re);
     if (excerpt === null) excerpt = html;
     out.push(`<p>${html}</p>\n`);
   }
@@ -669,8 +692,10 @@ function linkOf(s) {
   };
 }
 
-function pageOf(s) {
-  const card = cardOf(s);
+function pageOf(s, preCard) {
+  // Posts already have a card in the `cards` map (built for index/tag pages);
+  // reusing it avoids building the same card (with its tag array) twice.
+  const card = preCard ?? cardOf(s);
   return {
     title: card.title,
     url: card.url,
@@ -860,7 +885,7 @@ function build(input) {
   };
   const output = {};
   for (const s of kept) {
-    output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
+    output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s, s.post ? cards.get(s) : undefined) });
   }
   const per = input.site.per_page;
   const pages = Math.max(1, Math.ceil(posts.length / per));
